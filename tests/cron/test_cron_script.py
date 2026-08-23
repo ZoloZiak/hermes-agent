@@ -306,7 +306,130 @@ class TestRunJobScript:
         assert argv == [sys.executable, str(script)]
 
 
+    def test_macos_app_bundle_uses_virtualenv_python_for_script(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        from cron import scheduler_script as sched_script
+        from cron.scheduler_script import _run_job_script
 
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text('print("ok")\n', encoding="utf-8")
+
+        app_python = tmp_path / "Jarvis.app" / "Contents" / "MacOS" / "Jarvis"
+        app_python.parent.mkdir(parents=True)
+        app_python.write_text("", encoding="utf-8")
+        venv_python = tmp_path / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("", encoding="utf-8")
+
+        captured = {}
+
+        class FakeProc:
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured["kwargs"] = kwargs
+                self.returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                return ("ok\n", "")
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        monkeypatch.setattr(sched_script.sys, "platform", "darwin")
+        monkeypatch.setattr(sched_script.sys, "executable", str(app_python))
+        monkeypatch.setenv("VIRTUAL_ENV", str(venv_python.parent.parent))
+        monkeypatch.setattr(sched_script.subprocess, "Popen", FakeProc)
+
+        success, output = _run_job_script("probe.py")
+
+        assert success is True
+        assert output == "ok"
+        assert captured["argv"] == [str(venv_python), str(script.resolve())]
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows always takes the overlay/creationflags branch",
+    )
+    def test_non_windows_script_preserves_default_text_decoding(self, cron_env, monkeypatch):
+        # No platform patching: the Linux CI host already takes this branch.
+        from cron import scheduler_script as sched_script
+        from cron.scheduler_script import _run_job_script
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text('print("ok")\n')
+
+        captured = {}
+
+        class FakeProc:
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured["kwargs"] = kwargs
+                self.returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                return ("ok\n", "")
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        fake_run = FakeProc
+
+        monkeypatch.setattr(sched_script.sys, "platform", "linux")
+        monkeypatch.setattr(sched_script.subprocess, "Popen", fake_run)
+
+        success, output = _run_job_script("probe.py")
+
+        assert success is True
+        assert output == "ok"
+        assert captured["argv"] == [sys.executable, str(script.resolve())]
+        assert captured["kwargs"]["text"] is True
+        assert "creationflags" not in captured["kwargs"]
+        # Non-Windows keeps the platform-default (locale) encoding — ``encoding=`` is
+        # win32-only (#66566) — but ``errors="replace"`` is unconditional so a stray
+        # non-UTF-8 byte in stdout/stderr can't raise in communicate() (#105582).
+        assert "encoding" not in captured["kwargs"]
+        assert captured["kwargs"].get("errors") == "replace"
+
+    def test_non_overlay_branch_keeps_plain_argv(self, cron_env, monkeypatch):
+        """When the Windows uv-venv overlay is NOT active, the invocation must
+        stay a plain `python script.py` — the bootstrap is overlay-only.
+        Cross-platform: forces the non-overlay branch explicitly."""
+        from cron import scheduler_script as sched_script
+        from cron.scheduler_script import _run_job_script
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text('print("ok")\n', encoding="utf-8")
+
+        captured = {}
+
+        class FakeProc:
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                self.returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                return ("ok\n", "")
+
+        monkeypatch.setattr(sched_script, "_windows_cron_python_invocation",
+            lambda python_exe: (python_exe, {}),
+        )
+        monkeypatch.setattr(sched_script.subprocess, "Popen", FakeProc)
+
+        success, output = _run_job_script("probe.py")
+
+        assert success is True
+        assert output == "ok"
+        assert captured["argv"] == [sys.executable, str(script.resolve())]
 
     def test_emoji_stdout_round_trips_through_script_capture(self, cron_env):
         """Emoji in script stdout must reach the caller intact (#42384).
