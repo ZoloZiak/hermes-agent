@@ -4138,6 +4138,25 @@ def _call_fallback_candidate_sync(
     try:
         return _send_recovering(fb_client, fb_kwargs, destination)
     except Exception as fb_err:
+        # Fallback candidates get the same structured-output degradation as the
+        # primary path's ladder rungs: a provider that rejects the format field
+        # (DeepSeek, vLLM without xgrammar, strict Anthropic-wire gateways) gets
+        # one retry without it before the error aborts the auxiliary task.
+        if _is_structured_output_rejection(fb_err):
+            retry_kwargs = _without_structured_output_format(fb_kwargs)
+            if retry_kwargs is not None:
+                logger.info(
+                    "Auxiliary %s: fallback candidate %s rejected the "
+                    "structured-output format field; retrying once without it "
+                    "(schema enforcement degrades to prompt compliance): %s",
+                    task or "call", fb_label, fb_err,
+                )
+                try:
+                    return _send(fb_client, retry_kwargs, destination)
+                except Exception as retry_err:
+                    if not _is_auth_error(retry_err):
+                        raise
+                    fb_err = retry_err
         if not _is_auth_error(fb_err):
             capacity = fallback_candidate_unavailable_reason(fb_err)
             if capacity is None:
@@ -4188,6 +4207,23 @@ async def _call_fallback_candidate_async(
     try:
         return await _send_recovering(fb_client, fb_kwargs, destination)
     except Exception as fb_err:
+        # Structured-output degradation for fallback candidates, mirroring
+        # _call_fallback_candidate_sync (see its comment for the rationale).
+        if _is_structured_output_rejection(fb_err):
+            retry_kwargs = _without_structured_output_format(fb_kwargs)
+            if retry_kwargs is not None:
+                logger.info(
+                    "Auxiliary %s: fallback candidate %s rejected the "
+                    "structured-output format field; retrying once without it "
+                    "(schema enforcement degrades to prompt compliance): %s",
+                    task or "call", fb_label, fb_err,
+                )
+                try:
+                    return await _send(fb_client, retry_kwargs, destination)
+                except Exception as retry_err:
+                    if not _is_auth_error(retry_err):
+                        raise
+                    fb_err = retry_err
         if not _is_auth_error(fb_err):
             capacity = fallback_candidate_unavailable_reason(fb_err)
             if capacity is None:

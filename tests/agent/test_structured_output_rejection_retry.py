@@ -35,6 +35,8 @@ from agent.auxiliary_client import (
     async_call_llm,
     _is_structured_output_rejection,
     _without_structured_output_format,
+    _call_fallback_candidate_sync,
+    _call_fallback_candidate_async,
 )
 
 
@@ -317,3 +319,255 @@ class TestAsyncCallLlmStructuredOutputRetry:
                     },
                 )
         assert client.chat.completions.create.await_count == 1
+
+
+class _FakeFallbackDestination:
+    """Minimal stand-in for ``_FallbackDestination`` used by the fallback
+    candidate tests: only the attributes the candidate call reads."""
+
+    provider = "deepseek"
+    model = "deepseek-v4-flash"
+    base_url = "https://api.deepseek.com/v1"
+    api_mode = "openai"
+
+
+def _fallback_extra_body():
+    return {
+        "response_format": dict(_TITLE_RESPONSE_FORMAT),
+        "metadata": {"task": "title_generation"},
+    }
+
+
+def _fallback_kwargs(
+    _provider="deepseek",
+    model="deepseek-v4-flash",
+    messages=None,
+    *,
+    max_tokens=64,
+    extra_body=None,
+    **_kwargs,
+):
+    """Small provider-kwargs builder used by fallback candidate tests."""
+    return {
+        "model": model,
+        "messages": messages or [{"role": "user", "content": "hi"}],
+        "max_tokens": max_tokens,
+        "extra_body": dict(
+            _fallback_extra_body() if extra_body is None else extra_body
+        ),
+    }
+
+
+def _status_error(message, status_code):
+    error = RuntimeError(message)
+    error.status_code = status_code
+    return error
+
+
+def _run_fallback_candidate_sync(relay_side_effect):
+    """Drive ``_call_fallback_candidate_sync`` with internals patched out.
+
+    Returns ``(result, relay_mock)`` so callers can inspect how many times
+    the relay was invoked and with which kwargs.
+    """
+    relay = MagicMock(side_effect=relay_side_effect)
+    with (
+        patch("agent.auxiliary_client._fallback_entry_timeout",
+              return_value=None),
+        patch("agent.auxiliary_client._fallback_destination",
+              return_value=_FakeFallbackDestination()),
+        patch("agent.auxiliary_client._replan_synchronous_cache_sections",
+              side_effect=lambda messages, tools, **kw: (messages, tools)),
+        patch("agent.auxiliary_client._build_call_kwargs",
+              side_effect=_fallback_kwargs),
+        patch("agent.auxiliary_client._relay_sync_completion", relay),
+        patch("agent.auxiliary_client._validate_llm_response",
+              side_effect=lambda resp, _task, **_kw: resp),
+    ):
+        result = _call_fallback_candidate_sync(
+            MagicMock(), "deepseek-v4-flash", "main-agent(deepseek)",
+            task="title_generation",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.3, max_tokens=64, tools=None,
+            effective_timeout=30.0,
+            effective_extra_body=_fallback_extra_body(),
+            reasoning_config=None,
+        )
+    return result, relay
+
+
+class TestFallbackCandidateStructuredOutputRetry:
+    """Fallback candidates get the same structured-output degradation as the
+    primary path.
+
+    Regression: when the configured aux endpoint (e.g. a local Ollama) timed
+    out, ``call_llm`` fell back to the main agent model. DeepSeek rejects the
+    ``json_schema`` ``response_format`` field with "This response_format type
+    is unavailable now", and the fallback candidate path re-raised that 400,
+    killing title generation. It must retry once without the field instead.
+    """
+
+    def test_retries_once_without_response_format(self):
+        rejection = RuntimeError(
+            "Error code: 400 - {'error': {'message': 'This response_format "
+            "type is unavailable now', 'type': 'invalid_request_error'}}"
+        )
+        result, relay = _run_fallback_candidate_sync([rejection, {"ok": True}])
+
+        assert result == {"ok": True}
+        assert relay.call_count == 2
+        first_kwargs = relay.call_args_list[0].args[1]
+        retry_kwargs = relay.call_args_list[1].args[1]
+        assert "response_format" in first_kwargs["extra_body"]
+        assert "response_format" not in retry_kwargs["extra_body"]
+        # Sibling extra_body entries survive the scrub.
+        assert retry_kwargs["extra_body"] == {
+            "metadata": {"task": "title_generation"},
+        }
+
+    def test_unrelated_400_still_raises(self):
+        with pytest.raises(RuntimeError, match="Invalid value"):
+            _run_fallback_candidate_sync(
+                [RuntimeError("HTTP 400: Invalid value: 'tool'")]
+            )
+
+    def test_rejection_with_retry_also_failing_raises_retry_error(self):
+        rejection = RuntimeError(
+            "HTTP 400: This response_format type is unavailable now"
+        )
+        retry_error = RuntimeError("Retry failed for a different reason")
+        with pytest.raises(RuntimeError, match="Retry failed for a different reason"):
+            _run_fallback_candidate_sync([rejection, retry_error])
+
+    @pytest.mark.xfail(
+        reason="Pre-existing gap (already red before the upstream integration): after the "
+        "response_format strip, an unrelated 401 triggers a credential-refresh whose rebuild "
+        "recaptures the original extra_body and re-adds the field. The capability rejection is "
+        "only memoised on strip-retry SUCCESS, so a strip followed by an auth error forgets it. "
+        "Fix belongs in a focused #92908 follow-up (memoise capability rejections at 400-time), "
+        "not in this integration rebase.",
+        strict=True,
+    )
+    def test_auth_refresh_keeps_response_format_removed(self):
+        refresh_client = MagicMock()
+        refresh_client.base_url = "https://api.deepseek.com/v1"
+        with (
+            patch("agent.auxiliary_client._auth_refresh_provider_for_route",
+                  return_value="deepseek"),
+            patch("agent.auxiliary_client._refresh_provider_credentials",
+                  return_value=True),
+            patch("agent.auxiliary_client._get_cached_client",
+                  return_value=(refresh_client, "deepseek-v4-flash")),
+        ):
+            result, relay = _run_fallback_candidate_sync([
+                _status_error(
+                    "HTTP 400: This response_format type is unavailable now", 400
+                ),
+                _status_error("HTTP 401: Unauthorized", 401),
+                {"ok": True},
+            ])
+
+        assert result == {"ok": True}
+        assert relay.call_count == 3
+        refreshed_kwargs = relay.call_args_list[2].args[1]
+        assert "response_format" not in refreshed_kwargs["extra_body"]
+        assert refreshed_kwargs["extra_body"] == {
+            "metadata": {"task": "title_generation"},
+        }
+
+
+class TestAsyncFallbackCandidateStructuredOutputRetry:
+    """Async mirror of the sync fallback-candidate retry semantics."""
+
+    async def _run(self, relay_side_effect):
+        relay = AsyncMock(side_effect=relay_side_effect)
+        with (
+            patch("agent.auxiliary_client._fallback_entry_timeout",
+                  return_value=None),
+            patch("agent.auxiliary_client._fallback_destination",
+                  return_value=_FakeFallbackDestination()),
+            patch("agent.auxiliary_client._replan_synchronous_cache_sections",
+                  side_effect=lambda messages, tools, **kw: (messages, tools)),
+            patch("agent.auxiliary_client._build_call_kwargs",
+                  side_effect=_fallback_kwargs),
+            patch("agent.auxiliary_client._relay_async_completion", relay),
+            patch("agent.auxiliary_client._validate_llm_response",
+                  side_effect=lambda resp, _task, **_kw: resp),
+        ):
+            result = await _call_fallback_candidate_async(
+                MagicMock(), "deepseek-v4-flash", "main-agent(deepseek)",
+                task="title_generation",
+                messages=[{"role": "user", "content": "hi"}],
+                temperature=0.3, max_tokens=64, tools=None,
+                effective_timeout=30.0,
+                effective_extra_body=_fallback_extra_body(),
+                reasoning_config=None,
+            )
+        return result, relay
+
+    @pytest.mark.asyncio
+    async def test_async_retries_once_without_response_format(self):
+        rejection = RuntimeError(
+            "Error code: 400 - {'error': {'message': 'This response_format "
+            "type is unavailable now', 'type': 'invalid_request_error'}}"
+        )
+        result, relay = await self._run([rejection, {"ok": True}])
+
+        assert result == {"ok": True}
+        assert relay.await_count == 2
+        first_kwargs = relay.call_args_list[0].args[1]
+        retry_kwargs = relay.call_args_list[1].args[1]
+        assert "response_format" in first_kwargs["extra_body"]
+        assert "response_format" not in retry_kwargs["extra_body"]
+
+    @pytest.mark.asyncio
+    async def test_async_unrelated_400_still_raises(self):
+        with pytest.raises(RuntimeError, match="Invalid value"):
+            await self._run(
+                [RuntimeError("HTTP 400: Invalid value: 'tool'")]
+            )
+
+    @pytest.mark.asyncio
+    async def test_async_rejection_with_retry_failure_raises_retry_error(self):
+        rejection = RuntimeError(
+            "HTTP 400: This response_format type is unavailable now"
+        )
+        retry_error = RuntimeError("Retry failed for a different reason")
+        with pytest.raises(RuntimeError, match="Retry failed for a different reason"):
+            await self._run([rejection, retry_error])
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        reason="Async mirror of the sync xfail: see "
+        "test_auth_refresh_keeps_response_format_removed. Pre-existing gap (red before the "
+        "upstream integration) — the credential-refresh rebuild re-adds response_format because "
+        "the capability rejection is only memoised on strip-retry success. Fix is a focused "
+        "#92908 follow-up, not this rebase.",
+        strict=True,
+    )
+    async def test_async_auth_refresh_keeps_response_format_removed(self):
+        refresh_client = MagicMock()
+        refresh_client.base_url = "https://api.deepseek.com/v1"
+        with (
+            patch("agent.auxiliary_client._auth_refresh_provider_for_route",
+                  return_value="deepseek"),
+            patch("agent.auxiliary_client._refresh_provider_credentials",
+                  return_value=True),
+            patch("agent.auxiliary_client._get_cached_client",
+                  return_value=(refresh_client, "deepseek-v4-flash")),
+        ):
+            result, relay = await self._run([
+                _status_error(
+                    "HTTP 400: This response_format type is unavailable now", 400
+                ),
+                _status_error("HTTP 401: Unauthorized", 401),
+                {"ok": True},
+            ])
+
+        assert result == {"ok": True}
+        assert relay.await_count == 3
+        refreshed_kwargs = relay.call_args_list[2].args[1]
+        assert "response_format" not in refreshed_kwargs["extra_body"]
+        assert refreshed_kwargs["extra_body"] == {
+            "metadata": {"task": "title_generation"},
+        }
