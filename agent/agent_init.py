@@ -2261,6 +2261,9 @@ def _snapshot_primary_runtime(agent):
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
+        # Output-token budget lifted from the primary provider. Snapshotted so
+        # restore_primary_runtime can undo any fallback clamp on recovery.
+        "max_tokens": getattr(agent, "max_tokens", None),
         # Engine state _try_activate_fallback() overwrites (getattr: plugin engines may lack them).
         "compressor_model": getattr(_cc, "model", agent.model),
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url),

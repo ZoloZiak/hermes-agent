@@ -2162,6 +2162,26 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
                 provider=fb_provider, base_url=fb_base_url, api_mode=fb_api_mode, model=fb_model)
             agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
             _update_fallback_context_compressor(agent)
+            # Clamp the output-token budget to the fallback model's cap. ``agent.max_tokens``
+            # is lifted once at init from the PRIMARY provider's ``max_output_tokens`` (e.g. an
+            # Anthropic proxy pinning 200000). Without re-clamping, that primary budget carries
+            # onto a fallback with a smaller output cap (e.g. Groq's 16384), which then rejects
+            # EVERY request with a deterministic "max_tokens exceeds the output cap" 400 the loop
+            # does not route into compression — poisoning the session. Mirror of the
+            # context_compressor update just above. restore_primary_runtime puts the primary
+            # budget back from the snapshot on recovery.
+            try:
+                from hermes_cli.timeouts import get_provider_max_output_tokens
+                _fb_cap = get_provider_max_output_tokens(fb_provider, fb_model)
+                if isinstance(_fb_cap, int) and _fb_cap > 0:
+                    _cur = getattr(agent, "max_tokens", None)
+                    if not isinstance(_cur, int) or _cur > _fb_cap:
+                        agent.max_tokens = _fb_cap
+                        logger.info("Fallback %s/%s: clamped max_tokens %s → %s (fallback output cap)",
+                            fb_provider, fb_model, _cur, _fb_cap)
+            except Exception as _cap_err:
+                logger.debug("Fallback %s/%s: could not resolve output cap; leaving max_tokens unchanged: %s",
+                    fb_provider, fb_model, _cap_err)
             _reresolve_fallback_reasoning_config(agent)
             _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)

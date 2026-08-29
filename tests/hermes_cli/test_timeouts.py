@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import importlib
 import textwrap
-
 
 
 def _write_config(tmp_path, body: str) -> None:
@@ -14,6 +14,57 @@ def _write_config(tmp_path, body: str) -> None:
 
 
 
+
+
+def test_get_provider_max_output_tokens_resolution(monkeypatch, tmp_path):
+    """Per-model cap wins over provider-level; unknown → None (leave untouched).
+
+    Regression for the fallback max_tokens carry-over: when the primary's
+    output budget (e.g. an Anthropic proxy pinning 200000) is not re-clamped
+    to the fallback model's cap, a smaller-cap provider (Groq 8192/16384)
+    rejects every request with a deterministic output-cap 400. The clamp in
+    try_activate_fallback relies on this resolver returning the fallback's
+    real cap; None must mean "no config → don't touch max_tokens".
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(tmp_path, """\
+        providers:
+          groq:
+            models:
+              qwen/qwen3.8-27b:
+                max_output_tokens: 8192
+              openai/gpt-oss-120b:
+                max_output_tokens: 32768
+          capped-provider:
+            max_output_tokens: 4096
+            models:
+              some-model: {}
+          legacy-key:
+            models:
+              m1:
+                max_tokens: 5000
+        """)
+
+    from hermes_cli import config as cfg_mod
+    importlib.reload(cfg_mod)
+    from hermes_cli import timeouts as to_mod
+    importlib.reload(to_mod)
+
+    resolve = to_mod.get_provider_max_output_tokens
+
+    # Per-model max_output_tokens wins.
+    assert resolve("groq", "qwen/qwen3.8-27b") == 8192
+    assert resolve("groq", "openai/gpt-oss-120b") == 32768
+    # Provider-level fallback when the model has no own cap.
+    assert resolve("capped-provider", "some-model") == 4096
+    # ``max_tokens`` accepted as an alias for ``max_output_tokens``.
+    assert resolve("legacy-key", "m1") == 5000
+    # Unknown provider / unknown model with no provider-level cap → None.
+    assert resolve("nonexistent-xyz", "whatever") is None
+    assert resolve("groq", "unknown-model-abc") is None
+    # Empty provider id → None (guard).
+    assert resolve("", "qwen/qwen3.8-27b") is None
 
 
 def test_anthropic_adapter_honors_timeout_kwarg():

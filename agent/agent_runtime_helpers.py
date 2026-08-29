@@ -997,6 +997,12 @@ def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
     agent.base_url = rt["base_url"]           # setter updates _base_url_lower
     from hermes_cli.providers import is_actual_route
     agent.api_mode = "chat_completions" if is_actual_route(agent.provider, agent.base_url) else rt["api_mode"]
+    # Undo any output-cap clamp applied by try_activate_fallback so the primary's
+    # larger budget is available again on recovery. Only restore when the snapshot
+    # actually carried one (older snapshots predate the field); missing key leaves
+    # the current value untouched.
+    if "max_tokens" in rt:
+        agent.max_tokens = rt["max_tokens"]
     if hasattr(agent, "_transport_cache"):
         agent._transport_cache.clear()
     agent.api_key = rt["api_key"]
@@ -2251,6 +2257,9 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
         # See #75091.
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "runtime_capabilities": dict(getattr(agent, "runtime_capabilities", {}) or {}),
+        # Output-token budget lifted from the primary provider; restored on recovery
+        # to undo any fallback clamp (get_provider_max_output_tokens).
+        "max_tokens": getattr(agent, "max_tokens", None),
         "compressor_model": getattr(cc, "model", agent.model),
         "compressor_base_url": getattr(cc, "base_url", agent.base_url),
         "compressor_api_key": getattr(cc, "api_key", ""),
