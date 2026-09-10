@@ -18850,13 +18850,10 @@ app.on('before-quit', event => {
 })
 
 app.on('window-all-closed', () => {
-  // macOS convention: keep the process alive in the Dock when the user closes
-  // the last window. But when we're handing off to a detached updater / swap /
-  // uninstall script, the process MUST exit so the script can replace or remove
-  // the bundle and relaunch — without this the script's PID-wait spins to its
-  // full timeout and the user is left with an invisible app (or an uninstall
-  // that appears to do nothing).
-  if (process.platform !== 'darwin' || isQuittingForHandoff) {
-    app.quit()
-  }
+  // Closing the last window (the X button) should fully quit the app instead
+  // of leaving it parked in the macOS Dock. We therefore
+  // quit on every platform. `isQuittingForHandoff` is now redundant but kept
+  // referenced so the detached updater/swap/uninstall hand-off intent is clear.
+  void isQuittingForHandoff
+  app.quit()
 })
